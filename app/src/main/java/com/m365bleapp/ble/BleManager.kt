@@ -214,7 +214,11 @@ class BleManager(private val context: Context) {
         
         @Suppress("DEPRECATION")
         char.value = value
-        char.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        char.writeType = if (waitForResponse) {
+            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+        } else {
+            BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        }
         
         @Suppress("DEPRECATION")
         if (!gatt.writeCharacteristic(char)) {

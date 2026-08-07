@@ -84,6 +84,7 @@ private data class ScannedDevice(
         // Xiaomi M365 scooter service UUID
         private val XIAOMI_SERVICE_UUID = android.os.ParcelUuid.fromString("0000fe95-0000-1000-8000-00805f9b34fb")
         private const val XIAOMI_SCOOTER_NAME_PREFIX = "MIScooter"
+        private val NINEBOT_UART_SERVICE_UUID = android.os.ParcelUuid.fromString("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
     }
     
     /**
@@ -91,11 +92,19 @@ private data class ScannedDevice(
      */
     val isScooter: Boolean
         get() {
-            // Check if name starts with MIScooter
+            // Xiaomi M365 naming
             if (name?.startsWith(XIAOMI_SCOOTER_NAME_PREFIX) == true) return true
-            // Check if device advertises Xiaomi service UUID
+
+            // Classic Ninebot/Segway naming used by G30 BLE firmware.
+            val normalizedName = name?.lowercase().orEmpty()
+            if (normalizedName.contains("nbscooter") ||
+                normalizedName.contains("ninebot") ||
+                normalizedName.contains("segway")) return true
+
+            // Service UUID fallback: Xiaomi FE95 or Nordic UART used by Ninebot G30.
             val serviceUuids = scanResult.scanRecord?.serviceUuids
-            return serviceUuids?.contains(XIAOMI_SERVICE_UUID) == true
+            return serviceUuids?.contains(XIAOMI_SERVICE_UUID) == true ||
+                serviceUuids?.contains(NINEBOT_UART_SERVICE_UUID) == true
         }
 }
 
@@ -295,7 +304,7 @@ fun ScanScreen(
                 val deviceToConnect = selectedDevice
                 if (deviceToConnect != null) {
                     // Connect is now non-blocking and runs on Repository scope
-                    repository.connect(deviceToConnect.scanResult.device.address, register)
+                    repository.connect(deviceToConnect.scanResult.device.address, register, deviceToConnect.name)
                 }
                 selectedDevice = null
             }

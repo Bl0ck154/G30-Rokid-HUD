@@ -13,6 +13,8 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import com.m365bleapp.R
 import com.m365bleapp.ble.BleManager
+import com.m365bleapp.ble.G30ShuSession
+import com.m365bleapp.ble.ShuNinebotProtocol
 import com.m365bleapp.ffi.M365Native
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
@@ -132,6 +134,7 @@ class ScooterRepository private constructor(private val context: Context) {
 
     private var activeGatt: BluetoothGatt? = null
     private var sessionPtr: Long = 0
+    private var g30Session: G30ShuSession? = null
     
     // Single channel for all incoming data for now.
     // In strict implementation we might separate them, but sequential flow allows this.
@@ -194,7 +197,7 @@ class ScooterRepository private constructor(private val context: Context) {
             .onCompletion { _isScanning.value = false }
     }
 
-    fun connect(mac: String, register: Boolean = false) {
+    fun connect(mac: String, register: Boolean = false, preferredDeviceName: String? = null) {
         // Normalize MAC address to uppercase to ensure consistent token lookup
         val normalizedMac = mac.uppercase()
         scope.launch(Dispatchers.IO) @androidx.annotation.RequiresPermission(android.Manifest.permission.BLUETOOTH_CONNECT) {
@@ -202,7 +205,8 @@ class ScooterRepository private constructor(private val context: Context) {
             try {
                 val device = bleManager.getDevice(normalizedMac)
                 
-                // Clear old data from channels
+                // Clear old transport/session state and buffered data.
+                g30Session = null
                 while(controlChannel.tryReceive().isSuccess) {}
                 while(uartRxChannel.tryReceive().isSuccess) {}
                 
@@ -249,6 +253,43 @@ class ScooterRepository private constructor(private val context: Context) {
                 gatt.requestMtu(512)
                 delay(200)
 
+                // Classic G30 uses Ninebot UART + SHU crypto, not Xiaomi FE95 token auth.
+                val resolvedDeviceName = preferredDeviceName ?: runCatching { gatt.device.name }.getOrNull()
+                val normalizedDeviceName = resolvedDeviceName?.lowercase().orEmpty()
+                val hasUart = gatt.getService(UART_SERVICE) != null
+                val hasMiAuth = gatt.getService(AUTH_SERVICE) != null
+                val looksLikeG30 = normalizedDeviceName.contains("nbscooter") ||
+                    normalizedDeviceName.contains("ninebot") ||
+                    normalizedDeviceName.contains("segway")
+                val useG30Shu = hasUart && (looksLikeG30 || !hasMiAuth)
+
+                if (useG30Shu) {
+                    Log.i("ScooterRepo", "Using Ninebot G30 SHU authentication for $resolvedDeviceName")
+                    _connectionState.value = ConnectionState.Handshaking("Authenticating Ninebot G30…")
+                    val uartOk = bleManager.enableNotifications(gatt, UART_SERVICE, UART_RX) { }
+                    if (!uartOk) throw Exception("Could not enable Ninebot G30 UART notifications")
+
+                    val session = G30ShuSession(
+                        bleManager = bleManager,
+                        gatt = gatt,
+                        uartService = UART_SERVICE,
+                        uartWrite = UART_TX,
+                        incoming = uartRxChannel,
+                        deviceName = resolvedDeviceName
+                    )
+                    g30Session = session
+                    session.authenticate {
+                        _connectionState.value = ConnectionState.Handshaking(getString(R.string.state_press_power_button))
+                    }
+
+                    _connectionState.value = ConnectionState.Ready
+                    delay(300)
+                    readInitialStates()
+                    startTelemetryLoop()
+                    return@launch
+                }
+
+                // Xiaomi/M365 FE95 authentication path.
                 // Enable Notifications on Handshake chars
                 Log.d("ScooterRepo", "Enabling AUTH UPNP")
                 bleManager.enableNotifications(gatt, AUTH_SERVICE, AUTH_UPNP) { }
@@ -434,6 +475,12 @@ class ScooterRepository private constructor(private val context: Context) {
     // ... startTelemetryLoop uses writeNbParcel (raw) which is correct for UART ...
 
     private suspend fun startTelemetryLoop() {
+        val activeG30 = g30Session
+        if (activeG30 != null) {
+            startG30TelemetryLoop(activeG30)
+            return
+        }
+
         logger.startSession()
         Log.d("ScooterRepo", "Starting Telemetry Loop (sessionPtr=$sessionPtr)")
         
@@ -455,7 +502,7 @@ class ScooterRepository private constructor(private val context: Context) {
         
         while (currentCoroutineContext().isActive && activeGatt != null) {
             try {
-                if (sessionPtr == 0L) {
+                if (sessionPtr == 0L && g30Session == null) {
                      delay(1000)
                      continue
                 }
@@ -576,6 +623,72 @@ class ScooterRepository private constructor(private val context: Context) {
         }
     }
 
+    private suspend fun startG30TelemetryLoop(session: G30ShuSession) {
+        logger.startSession()
+        Log.i("ScooterRepo", "Starting G30 SHU telemetry loop")
+        var tick = 0
+        var lastTripQueryTick = 0
+        var lastRangeQueryTick = 0
+        var lastSpeed = 0.0
+        var consecutiveFailures = 0
+
+        while (currentCoroutineContext().isActive && activeGatt != null && g30Session === session) {
+            try {
+                val (attribute, length) = when {
+                    tick - lastTripQueryTick >= TRIP_QUERY_INTERVAL_TICKS -> {
+                        lastTripQueryTick = tick
+                        0x3A to 0x04
+                    }
+                    tick - lastRangeQueryTick >= RANGE_QUERY_INTERVAL_TICKS -> {
+                        lastRangeQueryTick = tick
+                        0x25 to 0x02
+                    }
+                    else -> 0xB0 to 0x20
+                }
+
+                val response = session.readRegister(attribute, length)
+                if (response != null) {
+                    parseG30Packet(response)
+                    consecutiveFailures = 0
+                    _motorInfo.value?.let { lastSpeed = it.speed }
+                } else {
+                    consecutiveFailures++
+                    Log.w("ScooterRepo", "G30 query 0x${attribute.toString(16)} timed out ($consecutiveFailures)")
+                }
+
+                if (consecutiveFailures >= 10) {
+                    _connectionState.value = ConnectionState.Error(getString(R.string.connection_lost))
+                    break
+                }
+                tick++
+            } catch (e: Exception) {
+                consecutiveFailures++
+                Log.w("ScooterRepo", "G30 telemetry error: ${e.message}")
+                if (consecutiveFailures >= 10) {
+                    _connectionState.value = ConnectionState.Error(getString(R.string.connection_lost))
+                    break
+                }
+            }
+
+            delay(if (lastSpeed > SPEED_THRESHOLD_KMH) POLL_INTERVAL_MOVING_MS else POLL_INTERVAL_IDLE_MS)
+        }
+    }
+
+    private fun parseG30Packet(packet: ByteArray) {
+        if (!ShuNinebotProtocol.isPacket(packet)) return
+        val attr = ShuNinebotProtocol.index(packet)
+        val data = ShuNinebotProtocol.payload(packet)
+        Log.d("ScooterRepo", "G30 response attr=0x${attr.toString(16)} data=${data.toHex()}")
+        when (attr) {
+            0xB0 -> parseMotorInfoFromData(data)
+            0x3A -> parseTripInfo(data)
+            0x25 -> parseRemainingKm(data)
+            0xB5 -> parseSpeedFromData(data)
+            0x7D -> parseTailLightState(data)
+            0x7C -> parseCruiseState(data)
+        }
+    }
+
     private fun buildPacket(dest: Byte, rw: Byte, attr: Byte, payload: ByteArray): ByteArray {
         // For ENCRYPTED UART communication (after login), the format is DIFFERENT
         // from raw M365 serial frames!
@@ -638,7 +751,7 @@ class ScooterRepository private constructor(private val context: Context) {
      * Direction: Master to Motor (0x20), Command: Write (0x03)
      */
     suspend fun lock(): Result<Unit> = withContext(Dispatchers.IO) {
-        if (sessionPtr == 0L) {
+        if (sessionPtr == 0L && g30Session == null) {
             return@withContext Result.failure(Exception("No active session"))
         }
         try {
@@ -665,7 +778,7 @@ class ScooterRepository private constructor(private val context: Context) {
      * Direction: Master to Motor (0x20), Command: Write (0x03)
      */
     suspend fun unlock(): Result<Unit> = withContext(Dispatchers.IO) {
-        if (sessionPtr == 0L) {
+        if (sessionPtr == 0L && g30Session == null) {
             return@withContext Result.failure(Exception("No active session"))
         }
         try {
@@ -701,7 +814,7 @@ class ScooterRepository private constructor(private val context: Context) {
      * Direction: Master to Motor (0x20), Command: Write (0x03)
      */
     suspend fun lightOn(): Result<Unit> = withContext(Dispatchers.IO) {
-        if (sessionPtr == 0L) {
+        if (sessionPtr == 0L && g30Session == null) {
             return@withContext Result.failure(Exception("No active session"))
         }
         try {
@@ -736,7 +849,7 @@ class ScooterRepository private constructor(private val context: Context) {
      * Direction: Master to Motor (0x20), Command: Write (0x03)
      */
     suspend fun lightOff(): Result<Unit> = withContext(Dispatchers.IO) {
-        if (sessionPtr == 0L) {
+        if (sessionPtr == 0L && g30Session == null) {
             return@withContext Result.failure(Exception("No active session"))
         }
         try {
@@ -780,7 +893,7 @@ class ScooterRepository private constructor(private val context: Context) {
      * Response: 0x0000=off, 0x0001=on brake, 0x0002=always on
      */
     suspend fun readLightState(): Result<Boolean> = withContext(Dispatchers.IO) {
-        if (sessionPtr == 0L) {
+        if (sessionPtr == 0L && g30Session == null) {
             return@withContext Result.failure(Exception("No active session"))
         }
         try {
@@ -823,14 +936,33 @@ class ScooterRepository private constructor(private val context: Context) {
      * Encrypts the packet and sends it via UART
      */
     private suspend fun sendCommand(packet: ByteArray, commandName: String = "Command") {
-        val counter = 0L  // Always use counter=0 (scooter doesn't track)
+        logger.logCommand(commandName, packet)
+
+        val g30 = g30Session
+        if (g30 != null) {
+            if (packet.size < 4) throw IllegalArgumentException("Invalid G30 command packet")
+            val rw = packet[2].toInt() and 0xFF
+            val attr = packet[3].toInt() and 0xFF
+            val payload = if (packet.size > 4) packet.copyOfRange(4, packet.size) else ByteArray(0)
+
+            if (rw == 0x01) {
+                val length = payload.firstOrNull()?.toInt()?.and(0xFF) ?: 1
+                val response = g30.readRegister(attr, length)
+                if (response != null) parseG30Packet(response)
+            } else {
+                // SHU's G30 lock/unlock registers use a single 0x01 value.
+                val g30Payload = if ((attr == 0x70 || attr == 0x71) && payload.isNotEmpty()) {
+                    byteArrayOf(payload[0])
+                } else payload
+                g30.writeRegister(attr, g30Payload)
+            }
+            return
+        }
+
+        val counter = 0L  // Xiaomi/M365 session transport
         val encrypted = native.encrypt(sessionPtr, packet, counter)
         Log.d("ScooterRepo", "Command Encrypted (${encrypted.size} bytes): ${encrypted.toHex()}")
-        
-        // Log the command to CSV
-        logger.logCommand(commandName, packet)
         logger.logUartTx(encrypted, "$commandName (encrypted)")
-        
         writeUartEncrypted(encrypted)
     }
     
@@ -1281,6 +1413,7 @@ class ScooterRepository private constructor(private val context: Context) {
                 
                 // Clean up resources
                 activeGatt = null
+                g30Session = null
                 if (sessionPtr != 0L) {
                     native.freeSession(sessionPtr)
                     sessionPtr = 0
@@ -1333,6 +1466,7 @@ class ScooterRepository private constructor(private val context: Context) {
             }
         }
         activeGatt = null
+        g30Session = null
         _connectionState.value = ConnectionState.Disconnected
         if (sessionPtr != 0L) {
              native.freeSession(sessionPtr)

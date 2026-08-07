@@ -26,6 +26,11 @@ jobs:
           distribution: temurin
           java-version: "21"
 
+      - name: Set up Gradle 9.3.0
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.3.0"
+
       - name: Apply G30 SHU compatibility port
         run: python3 tools/port_g30.py
 
@@ -40,9 +45,7 @@ jobs:
           fi
 
       - name: Build Android APK
-        run: |
-          chmod +x gradlew
-          ./gradlew :app:assembleDebug --stacktrace
+        run: gradle :app:assembleDebug --stacktrace
 
       - name: Prepare release APK
         run: |

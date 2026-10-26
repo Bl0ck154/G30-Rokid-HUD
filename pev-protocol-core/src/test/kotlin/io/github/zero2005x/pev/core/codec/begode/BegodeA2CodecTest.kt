@@ -198,4 +198,75 @@ class BegodeA2CodecTest {
         assertEquals(Evidence.WIRE_CAPTURED, diagnostic.layoutEvidence)
         assertTrue(diagnostic.telemetry.fields.isEmpty())
     }
+
+    @Test
+    fun timestampedLiveFramePopulatesOnlyVerifiedPackVoltageAndImuTemperature() {
+        // Real-vehicle observed raw values: voltageWord=6120 (61.20 V), temperatureRaw=-1600 (31.824 C), modeWord=137
+        val rawTempWord = (-1600) and 0xFFFF
+        val liveBytes = frame(0, 24, 6120, 0, 30, 0, 0, rawTempWord, 137, 1)
+        val diagnostic = frames(
+            BegodeA2Codec(Profile.A2, Evidence.WIRE_CAPTURED).feed(liveBytes, observedAtMs = 5_000L)
+        ).single()
+
+        assertEquals(FieldState.VALID, diagnostic.telemetry[FieldId.PACK_VOLTAGE].state)
+        assertEquals(61.20, diagnostic.telemetry[FieldId.PACK_VOLTAGE].value!!, 0.001)
+        assertEquals(5_000L, diagnostic.telemetry[FieldId.PACK_VOLTAGE].observedAtMs)
+        assertEquals(BegodeA2Codec.SOURCE_LIVE_00, diagnostic.telemetry[FieldId.PACK_VOLTAGE].source)
+
+        assertEquals(FieldState.VALID, diagnostic.telemetry[FieldId.TEMP_IMU].state)
+        assertEquals(-1600 / 340.0 + 36.53, diagnostic.telemetry[FieldId.TEMP_IMU].value!!, 0.001)
+
+        // Speed, current, SOC, distance, and modeWord must remain NOT_PROVIDED
+        for (unverified in listOf(
+            FieldId.SPEED_KMH,
+            FieldId.SOC_PERCENT,
+            FieldId.BATTERY_CURRENT,
+            FieldId.PHASE_CURRENT,
+            FieldId.TOTAL_DISTANCE_M,
+            FieldId.TRIP_DISTANCE_M,
+            FieldId.TEMP_FRAME,
+        )) {
+            assertEquals(FieldState.NOT_PROVIDED, diagnostic.telemetry[unverified].state)
+        }
+
+        // ASCII GW device-info reply recognition
+        assertEquals("GW1511014", BegodeA2Codec.parseDeviceInfoAsciiOrNull("GW1511014".toByteArray(Charsets.US_ASCII)))
+        assertEquals(null, BegodeA2Codec.parseDeviceInfoAsciiOrNull(liveBytes))
+    }
+
+    @Test
+    fun outOfRangeVerifiedFieldsAreInvalidNotClamped() {
+        val minTempWord = Short.MIN_VALUE.toInt() and 0xFFFF
+        for (voltageWord in listOf(100, 30_000)) {
+            val telemetry = frames(
+                BegodeA2Codec(Profile.A2).feed(frame(0, 24, voltageWord, 0, 0, 0, 0, minTempWord), observedAtMs = 1L)
+            ).single().telemetry
+            assertEquals(FieldState.INVALID, telemetry[FieldId.PACK_VOLTAGE].state)
+            assertEquals(null, telemetry[FieldId.PACK_VOLTAGE].value)
+            assertEquals(FieldState.INVALID, telemetry[FieldId.TEMP_IMU].state)
+        }
+    }
+
+    @Test
+    fun timestampDoesNotDecodeNonLiveFramesOrUnknownProfile() {
+        val nonLive = frames(BegodeA2Codec(Profile.A2).feed(frame(1, 0), observedAtMs = 1L)).single()
+        assertTrue(nonLive.telemetry.fields.isEmpty())
+        val unknown = frames(BegodeA2Codec(Profile.UNKNOWN).feed(frame(0, 24, 6120), observedAtMs = 1L)).single()
+        assertEquals(RawBody.Unresolved, unknown.body)
+        assertTrue(unknown.telemetry.fields.isEmpty())
+    }
+
+    @Test
+    fun deviceInfoAsciiRequiresBoundedAlphanumericGwPrefix() {
+        fun parse(text: String) = BegodeA2Codec.parseDeviceInfoAsciiOrNull(text.toByteArray(Charsets.US_ASCII))
+        assertEquals("GWab", parse("GWab"))
+        assertEquals("GW" + "Z".repeat(14), parse("GW" + "Z".repeat(14)))
+        assertEquals(null, parse("GW1"))
+        assertEquals(null, parse("GW" + "1".repeat(15)))
+        assertEquals(null, parse("XW151101"))
+        assertEquals(null, parse("GX151101"))
+        assertEquals(null, parse("GW15-101"))
+        assertEquals(null, parse("GW15 101"))
+        assertEquals(null, BegodeA2Codec.parseDeviceInfoAsciiOrNull(byteArrayOf(0x47, 0x57, 0x31, 0x80.toByte())))
+    }
 }

@@ -140,7 +140,9 @@ data class TelemetryData(
     val connectionState: Int = 0,        // 0=Disconnected, 1=Connecting, 2=Ready
     val tripMeters: Int = 0,             // Trip distance in meters
     val tripSeconds: Int = 0,            // Trip time in seconds
-    val isValid: Boolean = false         // CRC validation result
+    val isValid: Boolean = false,         // CRC validation result
+    val typedStates: Map<io.github.zero2005x.pev.core.gateway.GatewayField, io.github.zero2005x.pev.core.telemetry.FieldState>? = null,
+    val packVoltageV: Float = Float.NaN,
 ) {
     companion object {
         /**
@@ -178,7 +180,28 @@ data class TelemetryData(
     /**
      * Format trip time as MM:SS or HH:MM:SS
      */
+    fun fieldValid(field: io.github.zero2005x.pev.core.gateway.GatewayField): Boolean =
+        typedStates?.get(field)?.let { it == io.github.zero2005x.pev.core.telemetry.FieldState.VALID } ?: isValid
+
+    val hasValidBattery: Boolean
+        get() = fieldValid(io.github.zero2005x.pev.core.gateway.GatewayField.SOC_PERCENT) && scooterBattery in 0..100
+
+    val hasValidPackVoltage: Boolean
+        get() = fieldValid(io.github.zero2005x.pev.core.gateway.GatewayField.PACK_VOLTAGE) && packVoltageV.isFinite()
+
+    val hasValidTemperature: Boolean
+        get() = (typedStates?.let { states ->
+            listOf(
+                io.github.zero2005x.pev.core.gateway.GatewayField.TEMP_FRAME,
+                io.github.zero2005x.pev.core.gateway.GatewayField.TEMP_MOSFET,
+                io.github.zero2005x.pev.core.gateway.GatewayField.TEMP_IMU,
+                io.github.zero2005x.pev.core.gateway.GatewayField.TEMP_MOTOR,
+                io.github.zero2005x.pev.core.gateway.GatewayField.TEMP_BATTERY,
+            ).any { states[it] == io.github.zero2005x.pev.core.telemetry.FieldState.VALID }
+        } ?: isValid) && temperatureC.isFinite()
+
     fun formatTripTime(): String {
+        if (!fieldValid(io.github.zero2005x.pev.core.gateway.GatewayField.TRIP_TIME_S)) return "—"
         val hours = tripSeconds / 3600
         val minutes = (tripSeconds % 3600) / 60
         val seconds = tripSeconds % 60
@@ -194,6 +217,7 @@ data class TelemetryData(
      * Format mileage as km with 1 decimal
      */
     fun formatTripDistance(): String {
+        if (!fieldValid(io.github.zero2005x.pev.core.gateway.GatewayField.TRIP_DISTANCE_M)) return "—"
         val km = tripMeters / 1000f
         return String.format("%.1f km", km)
     }
@@ -202,6 +226,7 @@ data class TelemetryData(
      * Format total mileage
      */
     fun formatTotalMileage(): String {
+        if (!fieldValid(io.github.zero2005x.pev.core.gateway.GatewayField.TOTAL_DISTANCE_M)) return "—"
         val km = totalMileageM / 1000f
         return String.format("%.1f km", km)
     }

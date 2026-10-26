@@ -1,5 +1,6 @@
 package com.m365bleapp.ui
 
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -53,10 +54,10 @@ fun ScooterInfoScreen(
     repository: ScooterRepository,
     onBack: () -> Unit
 ) {
-    val motorInfo by repository.motorInfo.collectAsState()
+    val motorInfo by repository.motorInfo.collectAsStateWithLifecycle()
     val context = androidx.compose.ui.platform.LocalContext.current
     val snapshotStore = remember { VehicleSnapshotStore.getInstance(context) }
-    val snapshot by snapshotStore.snapshot.collectAsState()
+    val snapshot by snapshotStore.snapshot.collectAsStateWithLifecycle()
 
     // Re-render the "x minutes ago" banner without recomposing every frame.
     var nowMs by remember { mutableStateOf(System.currentTimeMillis()) }
@@ -73,9 +74,7 @@ fun ScooterInfoScreen(
     // Which fields this scooter can actually report. Capability-driven rather
     // than "does it look like an M365": a section whose register this model does
     // not have is hidden entirely instead of being rendered as a row of zeros.
-    val overrideStore = remember { ModelOverrideStore.getInstance(context) }
-    val modelOverride by overrideStore.override.collectAsState()
-    val identification = ScooterModelRegistry.resolve(snapshot.modelNameOrNull(), modelOverride)
+    val identification by repository.identification.collectAsStateWithLifecycle()
     val caps = identification.model.capabilities
 
     Scaffold(
@@ -151,10 +150,20 @@ private fun SpeedSection(
 ) {
     if (!caps.speed) return
     InfoCard(title = stringResource(R.string.info_speed_section)) {
+        val currentSpeed = if (isLive) {
+            live?.validSpeedOrNull(caps)?.toFloat()
+        } else {
+            snapshot.speedKmh.takeIf { !snapshot.isEmpty && !it.isNaN() }?.toFloat()
+        }
+        val avgSpeed = if (isLive) {
+            live?.avgSpeed?.takeIf { !it.isNaN() }?.toFloat()
+        } else {
+            snapshot.averageSpeedKmh.takeIf { !snapshot.isEmpty && !it.isNaN() }?.toFloat()
+        }
         InfoRow(
             label = stringResource(R.string.info_current_speed),
             value = formatOrDash(
-                live?.speed?.toFloat()?.takeIf { isLive } ?: snapshot.takeIf { !isLive }?.speedKmh?.toFloat(),
+                currentSpeed,
                 stringResource(R.string.unit_kmh)
             ),
             isLive = isLive
@@ -162,7 +171,7 @@ private fun SpeedSection(
         InfoRow(
             label = stringResource(R.string.info_avg_speed),
             value = formatOrDash(
-                live?.avgSpeed?.toFloat()?.takeIf { isLive } ?: snapshot.takeIf { !isLive }?.averageSpeedKmh?.toFloat(),
+                avgSpeed,
                 stringResource(R.string.unit_kmh)
             ),
             isLive = isLive
@@ -177,34 +186,54 @@ private fun BatterySection(
     isLive: Boolean,
     caps: ModelCapabilities
 ) {
-    if (!caps.batteryPercent) return
+    if (!caps.batteryPercent && !caps.packVoltage) return
     InfoCard(title = stringResource(R.string.info_battery_section)) {
-        val battery: Int? = if (live != null) live.battery else snapshot.batteryPercent.takeIf { !snapshot.isEmpty }
-        InfoRow(
-            label = stringResource(R.string.info_battery_level),
-            value = battery?.let { "$it${stringResource(R.string.unit_percent)}" }
-                ?: stringResource(R.string.value_unknown),
-            isLive = isLive
-        )
-        if (battery != null) {
-            LinearProgressIndicator(
-                progress = { battery / 100f },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(12.dp)
-                    .padding(top = 8.dp),
-                color = when {
-                    battery > 50 -> MaterialTheme.colorScheme.primary
-                    battery > 20 -> MaterialTheme.colorScheme.tertiary
-                    else -> MaterialTheme.colorScheme.error
-                }
+        if (caps.batteryPercent) {
+            val battery: Int? = if (live != null) {
+                live.validBatteryOrNull(caps)
+            } else {
+                snapshot.batteryPercent.takeIf { !snapshot.isEmpty && it in 0..100 }
+            }
+            InfoRow(
+                label = stringResource(R.string.info_battery_level),
+                value = battery?.let { "$it${stringResource(R.string.unit_percent)}" }
+                    ?: stringResource(R.string.value_unknown),
+                isLive = isLive
+            )
+            if (battery != null) {
+                LinearProgressIndicator(
+                    progress = { battery / 100f },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(12.dp)
+                        .padding(top = 8.dp),
+                    color = when {
+                        battery > 50 -> MaterialTheme.colorScheme.primary
+                        battery > 20 -> MaterialTheme.colorScheme.tertiary
+                        else -> MaterialTheme.colorScheme.error
+                    }
+                )
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+        }
+        if (caps.packVoltage) {
+            val voltageV: Double? = if (live != null) {
+                live.validPackVoltageOrNull(caps)
+            } else {
+                snapshot.packVoltageV?.takeIf { !snapshot.isEmpty && !it.isNaN() }
+            }
+            InfoRow(
+                label = stringResource(R.string.info_pack_voltage),
+                value = voltageV?.let { "${"%.2f".format(it)} V" }
+                    ?: stringResource(R.string.value_unknown),
+                isLive = isLive
             )
         }
-        Spacer(modifier = Modifier.height(8.dp))
         if (caps.remainingRange) InfoRow(
             label = stringResource(R.string.info_remaining_range),
             value = formatOrDash(
-                live?.remainingKm?.toFloat()?.takeIf { isLive } ?: snapshot.takeIf { !isLive }?.remainingKm?.toFloat(),
+                live?.remainingKm?.takeIf { !it.isNaN() }?.toFloat()?.takeIf { isLive }
+                    ?: snapshot.takeIf { !isLive && !it.isEmpty }?.remainingKm?.takeIf { !it.isNaN() }?.toFloat(),
                 stringResource(R.string.unit_km)
             ),
             isLive = isLive
@@ -276,7 +305,11 @@ private fun TemperatureSection(
 ) {
     if (!caps.temperature) return
     InfoCard(title = stringResource(R.string.info_system_section)) {
-        val temp: Double? = if (live != null) live.temp else snapshot.temperatureC.takeIf { !snapshot.isEmpty }
+        val temp: Double? = if (live != null) {
+            live.validTempOrNull(caps)
+        } else {
+            snapshot.temperatureC.takeIf { !snapshot.isEmpty && !it.isNaN() }
+        }
         InfoRow(
             label = stringResource(R.string.info_controller_temp),
             value = temp?.let { "${"%.1f".format(it)}${stringResource(R.string.unit_celsius)}" }

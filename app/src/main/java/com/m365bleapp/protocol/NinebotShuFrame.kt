@@ -45,3 +45,33 @@ internal class NinebotEncryptedReadSession(private val cipher: NinebotCryptoCiph
         return NinebotShuFrame.replyPayload(cipher.decrypt(ciphertext), register)
     }
 }
+
+/**
+ * Reassemble one encrypted SHU frame from arbitrary BLE notification fragments.
+ * Header bytes can arrive separately; a truncated or concatenated frame must
+ * never be passed to the stateful decryptor.
+ */
+internal class NinebotEncryptedFrameBuffer {
+    private var pending = ByteArray(0)
+
+    fun push(chunk: ByteArray): ByteArray? {
+        if (chunk.isEmpty()) return null
+        if (pending.size + chunk.size > 268) {
+            pending = ByteArray(0)
+            throw IllegalArgumentException("Ninebot encrypted frame exceeds 268 bytes")
+        }
+        pending += chunk
+        if (pending[0] != 0x5A.toByte() ||
+            (pending.size >= 2 && pending[1] != 0xA5.toByte())) {
+            pending = ByteArray(0)
+            throw IllegalArgumentException("Invalid Ninebot SHU sync")
+        }
+        val expected = NinebotShuFrame.encryptedLength(pending) ?: return null
+        if (pending.size > expected) {
+            pending = ByteArray(0)
+            throw IllegalArgumentException("Concatenated or overflowed Ninebot frame")
+        }
+        if (pending.size < expected) return null
+        return pending.also { pending = ByteArray(0) }
+    }
+}

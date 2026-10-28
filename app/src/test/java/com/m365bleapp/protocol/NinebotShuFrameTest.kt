@@ -29,6 +29,25 @@ class NinebotShuFrameTest {
         assertNull(NinebotShuFrame.replyPayload(full.copyOf().also { it[3] = 0x3E }, 0xB5))
     }
 
+    @Test fun `BLE fragments may split the two sync bytes and payload`() {
+        val reply = byteArrayOf(0x5A, 0xA5.toByte(), 2, 0x20, 0x3E, 1,
+            0xB5.toByte(), 0x10, 0x27) + ByteArray(6)
+        val buffer = NinebotEncryptedFrameBuffer()
+        assertNull(buffer.push(reply.copyOfRange(0, 1)))
+        assertNull(buffer.push(reply.copyOfRange(1, 2)))
+        assertNull(buffer.push(reply.copyOfRange(2, 7)))
+        assertArrayEquals(reply, buffer.push(reply.copyOfRange(7, reply.size)))
+    }
+
+    @Test fun `overflow cannot be sent to the decryptor`() {
+        val buffer = NinebotEncryptedFrameBuffer()
+        val header = byteArrayOf(0x5A, 0xA5.toByte(), 1)
+        assertNull(buffer.push(header))
+        org.junit.Assert.assertThrows(IllegalArgumentException::class.java) {
+            buffer.push(ByteArray(100))
+        }
+    }
+
     @Test fun `cipher can encrypt legal minimum SHU frames`() {
         val keyName = "NBScooter2020".toByteArray(Charsets.US_ASCII)
         val cipher = NinebotCryptoCipher.afterHandshake(keyName, ByteArray(16) { it.toByte() })

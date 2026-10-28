@@ -1365,21 +1365,13 @@ class ScooterRepository private constructor(
                         val request = session.buildRead(register, count)
                         check(submitEncryptedOnce(request, epoch)) { "Ninebot encrypted write failed" }
                         val deadline = System.currentTimeMillis() + PLAINTEXT_REPLY_TIMEOUT_MS
-                        var frame = ByteArray(0)
+                        val frameBuffer = com.m365bleapp.protocol.NinebotEncryptedFrameBuffer()
                         while (System.currentTimeMillis() < deadline && !accepted) {
                             val remaining = deadline - System.currentTimeMillis()
                             val chunk = withTimeoutOrNull(minOf(PLAINTEXT_CHUNK_WAIT_MS, remaining)) {
                                 capturedConnection().uart.receive()
                             } ?: continue
-                            if (chunk.isEmpty()) continue
-                            if (frame.isEmpty() &&
-                                (chunk.size < 2 || chunk[0] != 0x5A.toByte() || chunk[1] != 0xA5.toByte())
-                            ) continue
-                            frame += chunk
-                            val expected = com.m365bleapp.protocol.NinebotShuFrame.encryptedLength(frame)
-                                ?: continue
-                            if (frame.size > expected) throw IllegalArgumentException("Ninebot frame overflow")
-                            if (frame.size < expected) continue
+                            val frame = frameBuffer.push(chunk) ?: continue
                             val payload = session.accept(register, frame)
                             if (payload != null) {
                                 val update = com.m365bleapp.protocol.PlaintextTelemetryMapper.decode(
